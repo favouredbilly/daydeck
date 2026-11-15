@@ -17,12 +17,26 @@ export interface Task {
   place: { kind: 'inbox' } | { kind: 'slot'; part: SlotPart; index: number } | { kind: 'done' };
 }
 
+export interface Settings {
+  largeText: boolean;
+  swapSides: boolean;
+  calmMotion: boolean;
+}
+
 export interface DeckState {
   tasks: Task[];
   doneToday: number;
   streakDays: number;
   lastDoneDate: string | null;
+  /** 0-3: guided steps, 4: finishing message, 5: tutorial finished. */
+  tutorialStep: number;
+  settings: Settings;
+  /** Date (toDateString) when the user last ran "Review my day". */
+  reviewedOn: string | null;
+  lastVisit: string | null;
 }
+
+export const DEFAULT_SETTINGS: Settings = { largeText: false, swapSides: false, calmMotion: false };
 
 const KEY = 'daydeck.v1';
 
@@ -49,6 +63,10 @@ export function freshState(): DeckState {
     doneToday: 0,
     streakDays: 0,
     lastDoneDate: null,
+    tutorialStep: 0,
+    settings: { ...DEFAULT_SETTINGS },
+    reviewedOn: null,
+    lastVisit: null,
   };
 }
 
@@ -60,6 +78,11 @@ export function loadState(): DeckState {
       if (Array.isArray(s.tasks)) {
         const today = new Date().toDateString();
         if (s.lastDoneDate !== today) s.doneToday = 0;
+        // Fill fields added in later versions.
+        s.tutorialStep ??= 0;
+        s.settings = { ...DEFAULT_SETTINGS, ...(s.settings || {}) };
+        s.reviewedOn ??= null;
+        s.lastVisit ??= null;
         return s;
       }
     }

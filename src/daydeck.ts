@@ -3,10 +3,12 @@
 // Layout (meters, player origin at the floor, seated head about 1.2 m):
 //   - desk + card rack in front of you (within arm's reach)
 //   - the day board straight ahead (Morning / Afternoon / Evening)
-//   - the agent panel on the left, the Done panel on the right
+//   - the agent panel on one side, the Done panel on the other (swappable)
+//   - a guide banner above the board for the first five minutes
 
 import {
   BoxGeometry,
+  ConeGeometry,
   CylinderGeometry,
   createSystem,
   DistanceGrabbable,
@@ -14,22 +16,25 @@ import {
   Grabbed,
   Group,
   Hovered,
+  IcosahedronGeometry,
   Mesh,
   MeshBasicMaterial,
   MeshStandardMaterial,
-  PlaneGeometry,
   MovementMode,
+  Object3D,
+  PlaneGeometry,
+  PointLight,
   PokeInteractable,
   Pressed,
   Quaternion,
   RayInteractable,
+  SphereGeometry,
   Vector3,
 } from '@iwsdk/core';
-import { planDay, suggestTasks, type Proposal } from './agent.js';
+import { planDay, reviewDay, suggestTasks, type Proposal } from './agent.js';
 import { DeckButton, GhostCard, TaskCard } from './daydeck-components.js';
-import { C, CanvasPlane, drawButton, drawCard, FONT, roundRect, wrapText } from './draw.js';
+import { C, CanvasPlane, drawButton, drawCard, FONT, roundRect, setTextScale, ts, wrapText } from './draw.js';
 import {
-  firstFreeSlot,
   inboxTasks,
   loadState,
   markDone,
@@ -50,11 +55,15 @@ const COL_X: Record<SlotPart, number> = { morning: -0.46, afternoon: 0, evening:
 const SLOT_Y0 = 1.46;
 const SLOT_DY = 0.115;
 const RACK_COLS = 3;
-const AGENT_POS = new Vector3(-0.8, 1.2, -0.5);
-const DONE_POS = new Vector3(0.8, 1.2, -0.5);
+const LEFT_POS = new Vector3(-0.8, 1.2, -0.5);
+const RIGHT_POS = new Vector3(0.8, 1.2, -0.5);
 const HEAD_FALLBACK = new Vector3(0, 1.2, 0);
 
-type Btn = { plane: CanvasPlane; entity: Entity; label: string; style: 'primary' | 'secondary' | 'chip'; hover: boolean };
+type BtnStyle = 'primary' | 'secondary' | 'chip' | 'toggle-on';
+type Btn = { plane: CanvasPlane; entity: Entity; label: string; style: BtnStyle; hover: boolean };
+type Ghost = { entity: Entity; part: SlotPart; index: number; reason: string };
+
+const TUTORIAL_STEPS = 4;
 
 function facingYaw(pos: Vector3): number {
   return Math.atan2(-pos.x, -pos.z);
@@ -71,13 +80,19 @@ export class DayDeckSystem extends createSystem({
   private state!: DeckState;
   private cardEntities = new Map<string, Entity>();
   private cardPlanes = new Map<string, CanvasPlane>();
-  private ghosts = new Map<string, { entity: Entity; part: SlotPart; index: number; reason: string }>();
+  private ghosts = new Map<string, Ghost>();
   private targets = new Map<Entity, { pos: Vector3; quat: Quaternion; scale: number }>();
   private buttons = new Map<string, Btn>();
   private agentPanel!: CanvasPlane;
   private donePanel!: CanvasPlane;
   private board!: CanvasPlane;
-  private agentStatus = 'Pinch “Plan my day” and I will propose a schedule. You approve every move.';
+  private guideGroup!: Object3D;
+  private arrow!: Mesh;
+  private agentGroup!: Object3D;
+  private doneGroup!: Object3D;
+  private agentPos = LEFT_POS.clone();
+  private donePos = RIGHT_POS.clone();
+  private agentStatus = 'Hi! I am your planning agent. I propose, you decide: nothing moves without your pinch.';
   private agentSummary = '';
   private agentSource: 'ai' | 'offline' | '' = '';
   private busy = false;
@@ -92,16 +107,29 @@ export class DayDeckSystem extends createSystem({
   private grabStart = new Vector3();
   private dragPos = new Vector3();
   private slotTmp = new Vector3();
+  private arrowTarget = new Vector3();
+  private arrowVisible = false;
+  private time = 0;
 
   init(): void {
     this.state = loadState();
     (window as any).__deck = this;
+    setTextScale(this.state.settings.largeText ? 1.2 : 1);
+    if (this.state.settings.swapSides) {
+      this.agentPos.copy(RIGHT_POS);
+      this.donePos.copy(LEFT_POS);
+    }
+    this.welcomeBack();
     this.buildEnvironment();
     this.buildBoard();
     this.buildAgentPanel();
     this.buildDonePanel();
+    this.buildGuide();
     for (const t of this.state.tasks) if (t.place.kind !== 'done') this.spawnCard(t);
     this.layoutAll(true);
+    this.refreshGuide();
+    // Fonts load asynchronously; repaint once they are ready.
+    document.fonts?.ready.then(() => this.redrawEverything());
 
     this.queries.grabbedCards.subscribe('disqualify', (e) => this.onCardReleased(e));
     this.queries.grabbedCards.subscribe('qualify', (e) => {
@@ -116,6 +144,8 @@ export class DayDeckSystem extends createSystem({
   }
 
   update(delta: number): void {
+    this.time += delta;
+    const calm = this.state.settings.calmMotion;
     let dragging = false;
     for (const e of this.queries.grabbedCards.entities) {
       const o = e.object3D;
@@ -125,7 +155,8 @@ export class DayDeckSystem extends createSystem({
       break;
     }
     if (!dragging && this.highlight) this.setHighlight('');
-    const k = 1 - Math.exp(-delta * 12);
+
+    const k = calm ? 1 : 1 - Math.exp(-delta * 12);
     for (const [entity, t] of this.targets) {
       const o = entity.object3D;
       if (!o || entity.hasComponent(Grabbed)) continue;
@@ -133,21 +164,32 @@ export class DayDeckSystem extends createSystem({
       o.quaternion.slerp(t.quat, k);
       const s = o.scale.x + (t.scale - o.scale.x) * k;
       o.scale.setScalar(s);
-      if (o.position.distanceToSquared(t.pos) < 1e-7 && Math.abs(s - t.scale) < 1e-4) {
-        o.position.copy(t.pos);
+    }
+    // Gentle breathing on agent proposals so they read as "pending".
+    if (!calm) {
+      const pulse = 1 + 0.03 * Math.sin(this.time * 4);
+      for (const g of this.ghosts.values()) {
+        const o = g.entity.object3D;
+        const t = this.targets.get(g.entity);
+        if (o && t && Math.abs(o.scale.x - t.scale) < 0.05) o.scale.setScalar(pulse);
       }
+    }
+    // Tutorial pointer
+    if (this.arrowVisible) {
+      this.arrow.position.copy(this.arrowTarget);
+      this.arrow.position.y += 0.085 + (calm ? 0 : 0.02 * Math.sin(this.time * 5));
     }
   }
 
   // ---------------------------------------------------------------- building
 
-  private persistent<T extends Mesh | Group>(obj: T, parent?: Entity): Entity {
+  private persistent(obj: Object3D, parent?: Entity): Entity {
     return this.world.createTransformEntity(obj, parent ? { parent, persistent: true } : { persistent: true });
   }
 
   private buildEnvironment() {
-    const wood = new MeshStandardMaterial({ color: 0xc9a27a, roughness: 0.6 });
-    const dark = new MeshStandardMaterial({ color: 0x3a3548, roughness: 0.5 });
+    const wood = new MeshStandardMaterial({ color: 0xc79a6e, roughness: 0.55 });
+    const dark = new MeshStandardMaterial({ color: 0x3d3446, roughness: 0.5 });
     const desk = new Mesh(new BoxGeometry(1.4, 0.04, 0.5), wood);
     desk.position.set(0, 0.72, -0.48);
     desk.castShadow = desk.receiveShadow = true;
@@ -157,12 +199,50 @@ export class DayDeckSystem extends createSystem({
       leg.position.set(x, 0.35, z);
       this.persistent(leg);
     }
-    // card rack: a stepped stand on the desk
     for (let r = 0; r < 3; r++) {
       const step = new Mesh(new BoxGeometry(1.2, 0.02, 0.08), dark);
       step.position.set(0, 0.745 + r * 0.07, -0.32 - r * 0.1);
       this.persistent(step);
     }
+    // Cozy touches: a rug, a plant, a mug and a warm lamp glow.
+    const rug = new Mesh(new CylinderGeometry(1.15, 1.15, 0.01, 48), new MeshStandardMaterial({ color: 0xd99b7c, roughness: 0.95 }));
+    rug.position.set(0, 0.005, -0.35);
+    rug.receiveShadow = true;
+    this.persistent(rug);
+
+    const plant = new Group();
+    const pot = new Mesh(new CylinderGeometry(0.11, 0.085, 0.22, 24), new MeshStandardMaterial({ color: 0xe9e2d6, roughness: 0.7 }));
+    pot.position.y = 0.11;
+    plant.add(pot);
+    const leafMat = new MeshStandardMaterial({ color: 0x5f8f5a, roughness: 0.8, flatShading: true });
+    const blobs: Array<[number, number, number, number]> = [
+      [0, 0.36, 0, 0.13], [0.07, 0.47, 0.03, 0.1], [-0.07, 0.45, -0.02, 0.1], [0.02, 0.56, -0.03, 0.08],
+    ];
+    for (const [x, y, z, r] of blobs) {
+      const leaf = new Mesh(new IcosahedronGeometry(r, 1), leafMat);
+      leaf.position.set(x, y, z);
+      leaf.castShadow = true;
+      plant.add(leaf);
+    }
+    plant.position.set(-1.0, 0, -0.05);
+    this.persistent(plant);
+
+    const mug = new Group();
+    const cup = new Mesh(new CylinderGeometry(0.035, 0.032, 0.085, 24), new MeshStandardMaterial({ color: 0x5b4bdb, roughness: 0.4 }));
+    cup.position.y = 0.0425;
+    mug.add(cup);
+    const coffee = new Mesh(new CylinderGeometry(0.031, 0.031, 0.004, 24), new MeshStandardMaterial({ color: 0x4a2c1d, roughness: 0.3 }));
+    coffee.position.y = 0.08;
+    mug.add(coffee);
+    mug.position.set(0.58, 0.74, -0.26);
+    this.persistent(mug);
+
+    const lamp = new PointLight(0xffc98a, 2.2, 3.5, 2);
+    lamp.position.set(0, 1.9, -0.3);
+    this.persistent(lamp);
+    const bulb = new Mesh(new SphereGeometry(0.012, 12, 12), new MeshBasicMaterial({ color: 0xffd9a8 }));
+    bulb.position.copy(lamp.position);
+    this.persistent(bulb);
   }
 
   private buildBoard() {
@@ -184,23 +264,48 @@ export class DayDeckSystem extends createSystem({
     this.drawBoard();
   }
 
+  private boardTitle() {
+    return this.state.reviewedOn === new Date().toDateString() ? 'Tomorrow' : 'Today';
+  }
+
   private drawBoard() {
+    const title = this.boardTitle();
     this.board.redraw((g, w, h) => {
       roundRect(g, 4, 4, w - 8, h - 8, 36);
-      g.fillStyle = 'rgba(255,255,255,0.97)';
+      g.fillStyle = 'rgba(255,253,249,0.97)';
       g.fill();
       g.font = `800 46px ${FONT}`;
       g.textBaseline = 'middle';
       g.fillStyle = C.ink;
-      g.fillText('Today', 48, 56);
-      g.font = `500 30px ${FONT}`;
-      g.fillStyle = C.muted;
-      g.fillText('Pinch a card and drag it onto your day', 210, 58);
+      g.fillText(title, 48, 56);
+      const tw = g.measureText(title).width;
+      const step = this.state.tutorialStep;
+      if (step < 5) {
+        // Guided tour lives in the board header, always in view.
+        const x0 = 48 + tw + 28;
+        const pw = w - x0 - (step < TUTORIAL_STEPS ? 250 : 40);
+        roundRect(g, x0, 14, pw, 84, 42);
+        g.fillStyle = C.accent;
+        g.fill();
+        g.fillStyle = 'rgba(255,255,255,0.8)';
+        g.font = `800 28px ${FONT}`;
+        const tag = step < TUTORIAL_STEPS ? `${step + 1}/${TUTORIAL_STEPS}` : '✓';
+        g.fillText(tag, x0 + 30, 57);
+        g.fillStyle = '#fff';
+        g.font = `700 ${ts(29)}px ${FONT}`;
+        const lines = wrapText(g, this.guideText(), pw - 140, 2);
+        const lh = ts(33);
+        lines.forEach((l, i) => g.fillText(l, x0 + 110, 57 - ((lines.length - 1) * lh) / 2 + i * lh));
+      } else {
+        g.font = `500 ${ts(30)}px ${FONT}`;
+        g.fillStyle = C.muted;
+        g.fillText('Pinch a card and drag it onto your day', 48 + tw + 30, 58);
+      }
       const colW = w / 3;
       PARTS.forEach((p, i) => {
         const cx = colW * i + colW / 2;
         g.fillStyle = C.part[p];
-        g.font = `800 34px ${FONT}`;
+        g.font = `800 ${ts(34)}px ${FONT}`;
         g.textAlign = 'center';
         g.fillText(PART_LABEL[p], cx, 128);
         g.textAlign = 'left';
@@ -219,7 +324,7 @@ export class DayDeckSystem extends createSystem({
           } else {
             g.setLineDash([10, 10]);
             g.lineWidth = 3;
-            g.strokeStyle = '#cfc8dc';
+            g.strokeStyle = '#d6cfc4';
             g.stroke();
             g.setLineDash([]);
           }
@@ -229,20 +334,23 @@ export class DayDeckSystem extends createSystem({
   }
 
   private buildAgentPanel() {
-    const group = new Group();
-    group.position.copy(AGENT_POS);
-    group.rotation.y = facingYaw(AGENT_POS);
-    const parent = this.persistent(group);
+    this.agentGroup = new Group();
+    const parent = this.persistent(this.agentGroup);
+    this.placeSidePanel(this.agentGroup, this.agentPos);
     this.agentPanel = new CanvasPlane(1024, 1180, 0.6, 0.69);
     this.persistent(this.agentPanel.mesh, parent);
-    const bw = 0.5, bh = 0.07;
-    this.makeButton('plan', 'Plan my day', 'primary', bw, bh, 0, -0.105, parent);
+    this.makeButton('plan', 'Plan my day', 'primary', 0.5, 0.07, 0, -0.105, parent);
     this.makeButton('accept', 'Accept all', 'secondary', 0.24, 0.06, -0.13, -0.19, parent);
     this.makeButton('dismiss', 'Dismiss', 'secondary', 0.24, 0.06, 0.13, -0.19, parent);
     this.makeButton('ctx:Morning routine', 'Morning routine', 'chip', 0.18, 0.05, -0.19, -0.285, parent);
     this.makeButton('ctx:Deep work', 'Deep work', 'chip', 0.18, 0.05, 0, -0.285, parent);
     this.makeButton('ctx:Wind-down', 'Wind-down', 'chip', 0.18, 0.05, 0.19, -0.285, parent);
     this.drawAgentPanel();
+  }
+
+  private placeSidePanel(group: Object3D, pos: Vector3) {
+    group.position.copy(pos);
+    group.rotation.set(0, facingYaw(pos), 0);
   }
 
   private drawAgentPanel() {
@@ -253,49 +361,54 @@ export class DayDeckSystem extends createSystem({
       g.fill();
       g.textBaseline = 'middle';
       g.fillStyle = C.accent;
-      g.font = `800 50px ${FONT}`;
+      g.font = `800 48px ${FONT}`;
       g.fillText('✦ Planning agent', 48, 70);
-      g.font = `600 26px ${FONT}`;
-      g.fillStyle = C.muted;
-      const src = this.agentSource === 'ai' ? 'Claude' : this.agentSource === 'offline' ? 'Offline planner' : '';
-      if (src) g.fillText(src, w - 48 - g.measureText(src).width, 72);
-      g.font = `600 38px ${FONT}`;
+      // who is thinking: a clear badge
+      if (this.agentSource) {
+        const label = this.agentSource === 'ai' ? '✦ Claude' : 'Offline planner';
+        g.font = `700 28px ${FONT}`;
+        const bw = g.measureText(label).width + 36;
+        roundRect(g, w - 44 - bw, 46, bw, 50, 25);
+        g.fillStyle = this.agentSource === 'ai' ? C.accent : '#ece9f2';
+        g.fill();
+        g.fillStyle = this.agentSource === 'ai' ? '#fff' : C.muted;
+        g.fillText(label, w - 44 - bw + 18, 72);
+      }
+      g.font = `600 ${ts(36)}px ${FONT}`;
       g.fillStyle = C.ink;
-      let y = 145;
+      let y = 150;
       for (const line of wrapText(g, this.agentStatus, w - 96, 3)) {
         g.fillText(line, 48, y);
-        y += 48;
+        y += ts(46);
       }
       if (this.agentSummary) {
         y += 6;
-        g.font = `italic 500 32px ${FONT}`;
+        g.font = `italic 500 ${ts(31)}px ${FONT}`;
         g.fillStyle = C.muted;
         for (const line of wrapText(g, this.agentSummary, w - 96, 2)) {
           g.fillText(line, 48, y);
-          y += 42;
+          y += ts(40);
         }
       }
       y += 14;
-      g.font = `600 27px ${FONT}`;
       for (const [taskId, p] of proposals.slice(0, 6)) {
         const t = this.task(taskId);
         if (!t) continue;
+        if (y > 690) break;
         g.fillStyle = C.part[p.part];
         g.beginPath();
         g.arc(60, y, 11, 0, Math.PI * 2);
         g.fill();
         g.fillStyle = C.ink;
-        g.font = `700 32px ${FONT}`;
+        g.font = `700 ${ts(31)}px ${FONT}`;
         const head = `${t.title} → ${PART_LABEL[p.part].toLowerCase()}`;
         g.fillText(wrapText(g, head, w - 130, 1)[0], 84, y);
-        y += 38;
-        g.font = `500 28px ${FONT}`;
+        y += ts(37);
+        g.font = `500 ${ts(27)}px ${FONT}`;
         g.fillStyle = C.muted;
         g.fillText(wrapText(g, p.reason, w - 130, 1)[0], 84, y);
-        y += 50;
-        if (y > 690) break;
+        y += ts(48);
       }
-      // divider above buttons
       g.fillStyle = '#e6e2ee';
       g.fillRect(48, h * 0.62, w - 96, 3);
       g.font = `600 30px ${FONT}`;
@@ -305,34 +418,36 @@ export class DayDeckSystem extends createSystem({
   }
 
   private buildDonePanel() {
-    const group = new Group();
-    group.position.copy(DONE_POS);
-    group.rotation.y = facingYaw(DONE_POS);
-    const parent = this.persistent(group);
+    this.doneGroup = new Group();
+    const parent = this.persistent(this.doneGroup);
+    this.placeSidePanel(this.doneGroup, this.donePos);
     this.donePanel = new CanvasPlane(1024, 1180, 0.6, 0.69);
     this.persistent(this.donePanel.mesh, parent);
-    this.makeButton('reset', 'Start a new day', 'secondary', 0.3, 0.055, 0, -0.285, parent);
     const zone = new Mesh(new PlaneGeometry(0.53, 0.18), new MeshBasicMaterial({ transparent: true, opacity: 0, depthWrite: false }));
     zone.position.set(0, 0.2, 0.01);
     const ze = this.persistent(zone, parent);
     ze.addComponent(DeckButton, { action: 'drop:done' });
     ze.addComponent(RayInteractable);
+    this.makeButton('review', 'Review my day', 'primary', 0.5, 0.065, 0, -0.17, parent);
+    const st = this.state.settings;
+    this.makeButton('set:largeText', 'Aa Larger text', st.largeText ? 'toggle-on' : 'chip', 0.18, 0.05, -0.19, -0.285, parent);
+    this.makeButton('set:swapSides', '⇄ Swap sides', st.swapSides ? 'toggle-on' : 'chip', 0.18, 0.05, 0, -0.285, parent);
+    this.makeButton('set:calmMotion', 'Calm motion', st.calmMotion ? 'toggle-on' : 'chip', 0.18, 0.05, 0.19, -0.285, parent);
     this.drawDonePanel();
   }
 
   private drawDonePanel() {
     const s = this.state;
-    const done = s.tasks.filter((t) => t.place.kind === 'done').slice(-4).reverse();
+    const done = s.tasks.filter((t) => t.place.kind === 'done').slice(-3).reverse();
     this.donePanel.redraw((g, w, h) => {
       roundRect(g, 4, 4, w - 8, h - 8, 40);
-      g.fillStyle = 'rgba(255,255,255,0.97)';
+      g.fillStyle = 'rgba(255,253,249,0.97)';
       g.fill();
       g.textBaseline = 'middle';
       g.fillStyle = C.green;
-      g.font = `800 50px ${FONT}`;
+      g.font = `800 48px ${FONT}`;
       g.fillText('✓ Done', 48, 70);
-      // drop zone
-      roundRect(g, 48, 120, w - 96, 300, 32);
+      roundRect(g, 48, 120, w - 96, 280, 32);
       g.fillStyle = this.highlight === 'done' ? '#bfead4' : '#e8f6ef';
       g.fill();
       g.setLineDash([16, 12]);
@@ -341,35 +456,136 @@ export class DayDeckSystem extends createSystem({
       g.stroke();
       g.setLineDash([]);
       g.fillStyle = C.green;
-      g.font = `700 36px ${FONT}`;
+      g.font = `700 ${ts(36)}px ${FONT}`;
       g.textAlign = 'center';
-      g.fillText('Drop a finished card here', w / 2, 270);
+      g.fillText('Drop a finished card here', w / 2, 260);
       g.textAlign = 'left';
       g.fillStyle = C.ink;
-      g.font = `800 92px ${FONT}`;
-      g.fillText(String(s.doneToday), 60, 520);
-      g.font = `600 30px ${FONT}`;
+      g.font = `800 84px ${FONT}`;
+      g.fillText(String(s.doneToday), 60, 480);
+      g.font = `600 ${ts(30)}px ${FONT}`;
       g.fillStyle = C.muted;
-      g.fillText('done today', 60 + g.measureText('00').width + 70, 528);
+      g.fillText('done today', 170, 488);
       g.fillStyle = C.ink;
-      g.font = `800 92px ${FONT}`;
-      g.fillText(String(s.streakDays), 560, 520);
-      g.font = `600 30px ${FONT}`;
+      g.font = `800 84px ${FONT}`;
+      g.fillText(String(s.streakDays), 540, 480);
+      g.font = `600 ${ts(30)}px ${FONT}`;
       g.fillStyle = C.muted;
-      g.fillText('day streak', 560 + 90, 528);
-      let y = 650;
-      g.font = `500 34px ${FONT}`;
+      g.fillText(s.streakDays === 1 ? 'day streak' : 'days streak', 640, 488);
+      let y = 580;
+      g.font = `500 ${ts(32)}px ${FONT}`;
       for (const t of done) {
         g.fillStyle = C.green;
         g.fillText('✓', 60, y);
         g.fillStyle = C.muted;
         g.fillText(wrapText(g, t.title, w - 160, 1)[0], 104, y);
-        y += 52;
+        y += ts(48);
       }
+      g.fillStyle = '#e6e2ee';
+      g.fillRect(48, h * 0.83, w - 96, 3);
+      g.font = `600 26px ${FONT}`;
+      g.fillStyle = C.muted;
+      g.fillText('Comfort settings', 48, h * 0.865);
     });
   }
 
-  private makeButton(action: string, label: string, style: Btn['style'], w: number, h: number, x: number, y: number, parent: Entity) {
+  private buildGuide() {
+    const holder = new Group();
+    holder.position.set(0.6, 1.3 + 0.365 - 0.054, BOARD_Z + 0.004);
+    this.guideGroup = holder;
+    const parent = this.persistent(holder);
+    this.makeButton('guide:skip', 'Skip tour', 'secondary', 0.14, 0.05, 0, 0, parent);
+    this.buttons.get('guide:skip')!.plane.mesh.position.z = 0.002;
+    this.arrow = new Mesh(new ConeGeometry(0.022, 0.05, 20), new MeshBasicMaterial({ color: 0x5b4bdb }));
+    this.arrow.rotation.x = Math.PI; // point down
+    this.arrow.visible = false;
+    this.persistent(this.arrow);
+  }
+
+  private guideText(): string {
+    const agentSide = this.state.settings.swapSides ? 'right' : 'left';
+    const doneSide = this.state.settings.swapSides ? 'left' : 'right';
+    switch (this.state.tutorialStep) {
+      case 0:
+        return 'Pinch a card on your desk and drag it onto MORNING (or pinch it, then pinch a slot).';
+      case 1:
+        return `Now pinch ✦ Plan my day on your ${agentSide}. The AI agent will propose a plan.`;
+      case 2:
+        return 'Pinch a glowing ✦ card to accept it. You approve every move.';
+      case 3:
+        return `Finished something? Drag a card onto Done on your ${doneSide}.`;
+      default:
+        return 'You are set! Your board is saved. Tonight, pinch Review my day to close out.';
+    }
+  }
+
+  private refreshGuide() {
+    this.guideGroup.visible = this.state.tutorialStep < TUTORIAL_STEPS;
+    this.drawBoard();
+    this.updateArrow();
+  }
+
+  private updateArrow() {
+    const step = this.state.tutorialStep;
+    let target: Vector3 | null = null;
+    if (step === 0) {
+      const first = inboxTasks(this.state)[0];
+      const e = first && this.cardEntities.get(first.id);
+      if (e) {
+        this.rackPos(0, this.arrowTarget);
+        target = this.arrowTarget;
+      }
+    } else if (step === 1) {
+      const b = this.buttons.get('plan');
+      if (b) target = b.plane.mesh.getWorldPosition(this.arrowTarget);
+    } else if (step === 2) {
+      const g = this.ghosts.values().next().value as Ghost | undefined;
+      if (g) {
+        this.slotPos(g.part, g.index, this.arrowTarget);
+        target = this.arrowTarget;
+      }
+    } else if (step === 3) {
+      this.arrowTarget.copy(this.donePos);
+      this.arrowTarget.y += 0.2;
+      target = this.arrowTarget;
+    }
+    this.arrowVisible = !!target;
+    this.arrow.visible = this.arrowVisible;
+  }
+
+  /** Advance the tour when the user completes the step it asked for. */
+  private tutorial(completed: number) {
+    if (this.state.tutorialStep !== completed) return;
+    this.state.tutorialStep = completed + 1;
+    if (this.state.tutorialStep === TUTORIAL_STEPS) {
+      this.chime();
+      setTimeout(() => {
+        if (this.state.tutorialStep === TUTORIAL_STEPS) {
+          this.state.tutorialStep = 5;
+          saveState(this.state);
+          this.refreshGuide();
+        }
+      }, 7000);
+    }
+    saveState(this.state);
+    this.refreshGuide();
+  }
+
+  private welcomeBack() {
+    const today = new Date().toDateString();
+    const s = this.state;
+    if (s.lastVisit && s.lastVisit !== today && s.tutorialStep >= 5) {
+      const onBoard = s.tasks.filter((t) => t.place.kind === 'slot').length;
+      this.agentStatus =
+        s.streakDays > 0
+          ? `Welcome back! You are on a ${s.streakDays}-day streak. ${onBoard ? `${onBoard} cards are waiting on your board.` : 'Want me to plan today?'}`
+          : `Welcome back! ${onBoard ? `${onBoard} cards are waiting on your board.` : 'Want me to plan today?'}`;
+    }
+    s.lastVisit = today;
+    saveState(s);
+  }
+
+  private makeButton(action: string, label: string, style: BtnStyle, w: number, h: number, x: number, y: number, parent: Entity) {
     const plane = new CanvasPlane(Math.round(w * 1400), Math.round(h * 1400), w, h);
     plane.mesh.position.set(x, y, 0.012);
     const entity = this.persistent(plane.mesh, parent);
@@ -378,14 +594,27 @@ export class DayDeckSystem extends createSystem({
     entity.addComponent(PokeInteractable);
     const btn: Btn = { plane, entity, label, style, hover: false };
     this.buttons.set(action, btn);
-    plane.redraw((g, pw, ph) => drawButton(g, pw, ph, label, style));
+    this.drawBtn(btn);
+  }
+
+  private drawBtn(btn: Btn) {
+    btn.plane.redraw((g, pw, ph) => drawButton(g, pw, ph, btn.label, btn.style, btn.hover));
   }
 
   private setHover(e: Entity, hover: boolean) {
     const btn = this.buttons.get(e.getValue(DeckButton, 'action') as string);
     if (!btn) return;
     btn.hover = hover;
-    btn.plane.redraw((g, pw, ph) => drawButton(g, pw, ph, btn.label, btn.style, hover));
+    this.drawBtn(btn);
+  }
+
+  private redrawEverything() {
+    this.drawBoard();
+    this.drawAgentPanel();
+    this.drawDonePanel();
+    this.refreshGuide();
+    for (const t of this.state.tasks) this.drawTaskCard(t);
+    for (const b of this.buttons.values()) this.drawBtn(b);
   }
 
   // ---------------------------------------------------------------- cards
@@ -398,7 +627,10 @@ export class DayDeckSystem extends createSystem({
     const plane = new CanvasPlane(1024, 256, CARD_W, CARD_H);
     this.cardPlanes.set(t.id, plane);
     this.drawTaskCard(t);
-    if (from) plane.mesh.position.copy(from);
+    if (from) {
+      plane.mesh.position.copy(from);
+      plane.mesh.scale.setScalar(0.3);
+    }
     const entity = this.persistent(plane.mesh);
     entity.addComponent(TaskCard, { taskId: t.id });
     entity.addComponent(RayInteractable);
@@ -459,8 +691,10 @@ export class DayDeckSystem extends createSystem({
       for (const [e, t] of this.targets) {
         e.object3D?.position.copy(t.pos);
         e.object3D?.quaternion.copy(t.quat);
+        e.object3D?.scale.setScalar(t.scale);
       }
     }
+    if (this.state.tutorialStep === 0) this.updateArrow();
   }
 
   private headPos(out: Vector3) {
@@ -481,7 +715,7 @@ export class DayDeckSystem extends createSystem({
 
   /** Where a card at `pos` would land: 'done', 'part:index', or '' (back to rack). */
   private dropTarget(pos: Vector3): string {
-    if (this.angleFromHead(pos, DONE_POS) < 0.26) return 'done';
+    if (this.angleFromHead(pos, this.donePos) < 0.26) return 'done';
     let best = '';
     let bestAng = 0.15;
     for (const part of PARTS) {
@@ -504,28 +738,41 @@ export class DayDeckSystem extends createSystem({
     this.setHighlight('');
     if (!t || !o) return;
     const target = this.dropTarget(o.getWorldPosition(this.dragPos));
-    // A real drag cancels any tap-selection that the pinch started.
-    if (this.dragPos.distanceTo(this.grabStart) > 0.03 && this.selectedId === t.id) this.selectedId = '';
+    if (this.dragPos.distanceTo(this.grabStart) > 0.03 && this.selectedId === t.id) {
+      this.selectedId = '';
+      if (this.agentStatus.startsWith('Picked')) {
+        this.agentStatus = 'Nice move. Pinch “Plan my day” whenever you want my suggestions.';
+        this.drawAgentPanel();
+      }
+    }
     if (target === 'done') {
       this.completeTask(t);
       return;
     }
     if (target) {
       const [part, idxStr] = target.split(':') as [SlotPart, string];
-      const index = Number(idxStr);
-      const occupant = this.state.tasks.find(
-        (x) => x.id !== t.id && x.place.kind === 'slot' && x.place.part === part && x.place.index === index,
-      );
-      if (occupant) occupant.place = t.place.kind === 'slot' ? { ...t.place } : { kind: 'inbox' };
-      t.place = { kind: 'slot', part, index };
-      this.removeGhost(t.id);
-      this.blip(660, 0.06);
-      if (occupant) this.drawTaskCard(occupant);
-    } else if (t.place.kind === 'slot') {
-      t.place = { kind: 'inbox' };
+      this.placeTask(t, part, Number(idxStr));
+      return;
     }
+    if (t.place.kind === 'slot') t.place = { kind: 'inbox' };
     this.drawTaskCard(t);
     this.commit();
+  }
+
+  private placeTask(t: Task, part: SlotPart, index: number) {
+    const occupant = this.state.tasks.find(
+      (x) => x.id !== t.id && x.place.kind === 'slot' && x.place.part === part && x.place.index === index,
+    );
+    if (occupant) {
+      occupant.place = t.place.kind === 'slot' ? { ...t.place } : { kind: 'inbox' };
+      this.drawTaskCard(occupant);
+    }
+    t.place = { kind: 'slot', part, index };
+    this.removeGhost(t.id);
+    this.blip(660, 0.06);
+    this.drawTaskCard(t);
+    this.commit();
+    this.tutorial(0);
   }
 
   private setHighlight(h: string) {
@@ -539,8 +786,7 @@ export class DayDeckSystem extends createSystem({
   /** Tap-to-place: tap a card, then tap a slot or the Done zone. */
   private toggleSelect(id: string) {
     const e = this.cardEntities.get(id);
-    // A pinch that moved the card is a drag, not a tap.
-    if (e?.object3D && e.object3D.getWorldPosition(this.dragPos).distanceTo(this.grabStart) > 0.03 && this.grabStart.lengthSq() > 0) {
+    if (e?.object3D && this.grabStart.lengthSq() > 0 && e.object3D.getWorldPosition(this.dragPos).distanceTo(this.grabStart) > 0.03) {
       this.grabStart.set(0, 0, 0);
       return;
     }
@@ -552,7 +798,7 @@ export class DayDeckSystem extends createSystem({
     }
     if (this.selectedId) {
       const t = this.task(this.selectedId)!;
-      this.agentStatus = `Picked “${t.title}”. Tap a slot on the board, or the Done zone.`;
+      this.agentStatus = `Picked “${t.title}”. Now pinch a slot on the board, or the Done zone.`;
       this.drawAgentPanel();
       this.blip(600, 0.04);
     }
@@ -568,19 +814,7 @@ export class DayDeckSystem extends createSystem({
       return;
     }
     const [, part, idx] = action.split(':') as [string, SlotPart, string];
-    const index = Number(idx);
-    const occupant = this.state.tasks.find(
-      (x) => x.id !== t.id && x.place.kind === 'slot' && x.place.part === part && x.place.index === index,
-    );
-    if (occupant) {
-      occupant.place = t.place.kind === 'slot' ? { ...t.place } : { kind: 'inbox' };
-      this.drawTaskCard(occupant);
-    }
-    t.place = { kind: 'slot', part, index };
-    this.removeGhost(t.id);
-    this.blip(660, 0.06);
-    this.drawTaskCard(t);
-    this.commit();
+    this.placeTask(t, part, Number(idx));
   }
 
   private completeTask(t: Task) {
@@ -588,15 +822,23 @@ export class DayDeckSystem extends createSystem({
     markDone(this.state);
     const e = this.cardEntities.get(t.id);
     if (e) {
-      this.targets.delete(e);
-      e.dispose();
       this.cardEntities.delete(t.id);
       this.cardPlanes.delete(t.id);
+      // Fly into the Done zone, shrink, then remove.
+      this.tmpA.copy(this.donePos);
+      this.tmpA.y += 0.2;
+      const q = new Quaternion().setFromAxisAngle(new Vector3(0, 1, 0), facingYaw(this.donePos));
+      this.setTarget(e, this.tmpA, q, 0.15);
+      setTimeout(() => {
+        this.targets.delete(e);
+        e.dispose();
+      }, this.state.settings.calmMotion ? 0 : 450);
     }
     this.removeGhost(t.id);
     this.chord();
     this.drawDonePanel();
     this.commit();
+    this.tutorial(3);
   }
 
   private commit() {
@@ -604,7 +846,7 @@ export class DayDeckSystem extends createSystem({
     this.layoutAll();
   }
 
-  // ---------------------------------------------------------------- agent
+  // ---------------------------------------------------------------- buttons
 
   private onButton(action: string) {
     if (action.startsWith('slot:') || action === 'drop:done') {
@@ -615,20 +857,48 @@ export class DayDeckSystem extends createSystem({
     if (action === 'plan') void this.runPlan();
     else if (action === 'accept') this.acceptAll();
     else if (action === 'dismiss') this.clearGhosts('Plan dismissed. Nothing was moved.');
-    else if (action === 'reset') this.newDay();
+    else if (action === 'review') void this.runReview();
+    else if (action === 'guide:skip') {
+      this.state.tutorialStep = 5;
+      saveState(this.state);
+      this.refreshGuide();
+    } else if (action.startsWith('set:')) this.toggleSetting(action.slice(4) as keyof DeckState['settings']);
     else if (action.startsWith('ctx:')) void this.dealCards(action.slice(4));
   }
+
+  private toggleSetting(key: keyof DeckState['settings']) {
+    const st = this.state.settings;
+    st[key] = !st[key];
+    const btn = this.buttons.get(`set:${key}`);
+    if (btn) {
+      btn.style = st[key] ? 'toggle-on' : 'chip';
+      this.drawBtn(btn);
+    }
+    if (key === 'largeText') {
+      setTextScale(st.largeText ? 1.2 : 1);
+      this.redrawEverything();
+    } else if (key === 'swapSides') {
+      this.agentPos.copy(st.swapSides ? RIGHT_POS : LEFT_POS);
+      this.donePos.copy(st.swapSides ? LEFT_POS : RIGHT_POS);
+      this.placeSidePanel(this.agentGroup, this.agentPos);
+      this.placeSidePanel(this.doneGroup, this.donePos);
+      this.refreshGuide();
+    }
+    saveState(this.state);
+  }
+
+  // ---------------------------------------------------------------- agent
 
   private async runPlan() {
     if (this.busy) return;
     const tasks = inboxTasks(this.state);
     if (!tasks.length) {
-      this.agentStatus = 'Your rack is empty. Ask me for ideas below, or start a new day.';
+      this.agentStatus = 'Your rack is empty. Ask me for ideas below, or review your day.';
       this.drawAgentPanel();
       return;
     }
     this.busy = true;
-    this.clearGhosts('Thinking about your day…', false);
+    this.clearGhosts('Thinking about your day…');
     const occupied = { morning: 0, afternoon: 0, evening: 0 } as Record<SlotPart, number>;
     for (const t of this.state.tasks) if (t.place.kind === 'slot') occupied[t.place.part]++;
     const result = await planDay(tasks, occupied);
@@ -638,7 +908,31 @@ export class DayDeckSystem extends createSystem({
     this.showProposals(result.proposals);
   }
 
-  private showProposals(proposals: Proposal[]) {
+  private async runReview() {
+    if (this.busy) return;
+    this.busy = true;
+    this.clearGhosts('Reviewing your day…');
+    const done = this.state.tasks.filter((t) => t.place.kind === 'done').map((t) => t.title);
+    const unfinished = this.state.tasks.filter((t) => t.place.kind !== 'done');
+    const r = await reviewDay(done, unfinished, this.state.streakDays);
+    this.busy = false;
+    this.agentSource = r.source;
+    // Close today: finished cards are archived, unfinished ones return to the rack.
+    this.state.tasks = unfinished;
+    for (const t of unfinished) {
+      t.place = { kind: 'inbox' };
+      this.drawTaskCard(t);
+    }
+    this.state.doneToday = 0;
+    this.state.reviewedOn = new Date().toDateString();
+    this.drawBoard();
+    this.drawDonePanel();
+    this.commit();
+    this.agentSummary = r.summary;
+    this.showProposals(r.proposals, r.recap);
+  }
+
+  private showProposals(proposals: Proposal[], intro?: string) {
     const taken = new Set<string>();
     for (const t of this.state.tasks) if (t.place.kind === 'slot') taken.add(`${t.place.part}:${t.place.index}`);
     let placed = 0;
@@ -656,9 +950,9 @@ export class DayDeckSystem extends createSystem({
         if (index >= 0) break;
       }
       if (index < 0) continue;
-      taken.add(`${part}:${index}`);
       const t = this.task(p.taskId);
-      if (!t) continue;
+      if (!t || t.place.kind !== 'inbox' || this.ghosts.has(t.id)) continue;
+      taken.add(`${part}:${index}`);
       const plane = new CanvasPlane(1024, 256, CARD_W, CARD_H);
       plane.redraw((g, w, h) => drawCard(g, w, h, t.title, t.minutes, { ghost: true }));
       const card = this.cardEntities.get(t.id)?.object3D;
@@ -674,11 +968,14 @@ export class DayDeckSystem extends createSystem({
       this.ghosts.set(t.id, { entity, part, index, reason: p.reason });
       placed++;
     }
-    this.agentStatus = placed
+    const ask = placed
       ? `I propose ${placed} placement${placed > 1 ? 's' : ''}. Pinch a glowing card to accept it, or accept all.`
       : 'Your board is full. Finish or move something first.';
+    this.agentStatus = intro ? `${intro} ${placed ? 'Pinch a glowing card to keep it for tomorrow.' : ''}`.trim() : ask;
     this.drawAgentPanel();
     this.chime();
+    if (placed) this.tutorial(1);
+    else this.updateArrow();
   }
 
   private acceptProposal(taskId: string) {
@@ -695,6 +992,8 @@ export class DayDeckSystem extends createSystem({
     if (!this.ghosts.size) this.agentSummary = '';
     this.drawAgentPanel();
     this.commit();
+    this.tutorial(2);
+    this.updateArrow();
   }
 
   private acceptAll() {
@@ -710,12 +1009,11 @@ export class DayDeckSystem extends createSystem({
     this.ghosts.delete(taskId);
   }
 
-  private clearGhosts(status: string, redraw = true) {
+  private clearGhosts(status: string) {
     for (const id of [...this.ghosts.keys()]) this.removeGhost(id);
     this.agentStatus = status;
     this.agentSummary = '';
-    if (redraw) this.drawAgentPanel();
-    else this.drawAgentPanel();
+    this.drawAgentPanel();
   }
 
   private async dealCards(context: string) {
@@ -728,7 +1026,7 @@ export class DayDeckSystem extends createSystem({
     this.agentSource = r.source;
     const room = Math.max(0, 9 - inboxTasks(this.state).length);
     const fresh = r.tasks.slice(0, room);
-    const origin = new Vector3().copy(AGENT_POS);
+    const origin = this.agentPos.clone();
     for (const s of fresh) {
       const t: Task = { id: newId(), title: s.title, minutes: Math.max(5, Math.round(s.minutes || 15)), place: { kind: 'inbox' } };
       this.state.tasks.push(t);
@@ -739,19 +1037,6 @@ export class DayDeckSystem extends createSystem({
       : 'Your rack is full. Place or finish a few cards first.';
     this.drawAgentPanel();
     this.chime();
-    this.commit();
-  }
-
-  private newDay() {
-    this.clearGhosts('New day. Pinch “Plan my day” when you are ready.');
-    // Move unfinished board cards back to the rack, drop finished ones.
-    this.state.tasks = this.state.tasks.filter((t) => t.place.kind !== 'done');
-    for (const t of this.state.tasks) {
-      t.place = { kind: 'inbox' };
-      this.drawTaskCard(t);
-    }
-    this.state.doneToday = 0;
-    this.drawDonePanel();
     this.commit();
   }
 
@@ -772,12 +1057,13 @@ export class DayDeckSystem extends createSystem({
     const o = a.createOscillator();
     const g = a.createGain();
     o.frequency.value = freq;
-    o.type = 'sine';
-    g.gain.setValueAtTime(0.08, a.currentTime);
+    o.type = 'triangle';
+    g.gain.setValueAtTime(0.0001, a.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.06, a.currentTime + 0.01);
     g.gain.exponentialRampToValueAtTime(0.0001, a.currentTime + dur * 3);
     o.connect(g).connect(a.destination);
     o.start();
-    o.stop(a.currentTime + dur * 3);
+    o.stop(a.currentTime + dur * 3 + 0.02);
   }
 
   private chime() {

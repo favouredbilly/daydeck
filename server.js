@@ -35,6 +35,20 @@ const PLAN_TOOL = {
   },
 };
 
+const REVIEW_TOOL = {
+  name: 'review_day',
+  description: 'Close out the user\'s day: a warm, specific recap, then a proposed placement for each unfinished card in tomorrow\'s plan. The user accepts or rejects each placement with a hand gesture.',
+  input_schema: {
+    type: 'object',
+    properties: {
+      recap: { type: 'string', description: 'Two short sentences max (30 words): acknowledge specific finished tasks and the streak; encouraging, never guilt-tripping.' },
+      summary: { type: 'string', description: 'One short sentence on how tomorrow is arranged (max 16 words).' },
+      proposals: PLAN_TOOL.input_schema.properties.proposals,
+    },
+    required: ['recap', 'summary', 'proposals'],
+  },
+};
+
 const SUGGEST_TOOL = {
   name: 'deal_cards',
   description: 'Suggest small, concrete task cards for the given context.',
@@ -87,6 +101,20 @@ app.post('/api/agent', async (req, res) => {
         PLAN_TOOL,
         'You are DayDeck, a calm planning agent inside a VR productivity space. You place the user\'s task cards into Morning, Afternoon or Evening. Put focus-heavy work when energy is high (morning), reactive/admin work after lunch, and personal or low-effort tasks in the evening. Each part holds at most 4 cards; some slots may already be taken. Never invent tasks; use only the given ids.',
         `Local time: ${String(req.body.localTime || '').slice(0, 10)}\nSlots already used: ${JSON.stringify(occupied)}\nTasks:\n${JSON.stringify(tasks)}`,
+      );
+      return res.json(out);
+    }
+    if (action === 'review') {
+      const done = (req.body.done || []).slice(0, 20).map((t) => String(t).slice(0, 80));
+      const unfinished = (req.body.unfinished || []).slice(0, 12).map((t) => ({
+        id: String(t.id).slice(0, 40),
+        title: String(t.title).slice(0, 80),
+        minutes: Number(t.minutes) || 15,
+      }));
+      const out = await callTool(
+        REVIEW_TOOL,
+        'You are DayDeck, a calm planning agent inside a VR productivity space. At the end of the day you review what the user finished and plan tomorrow for what is left. Be kind and specific. Never invent tasks; use only the given ids. Each part (morning, afternoon, evening) holds at most 4 cards.',
+        `Finished today: ${JSON.stringify(done)}\nCurrent streak (days): ${Number(req.body.streak) || 0}\nUnfinished cards:\n${JSON.stringify(unfinished)}`,
       );
       return res.json(out);
     }

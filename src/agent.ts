@@ -61,6 +61,44 @@ export async function planDay(
   return offlinePlan(tasks);
 }
 
+export interface ReviewResult extends PlanResult {
+  recap: string;
+}
+
+/** End-of-day review: a short recap plus a proposed plan for carrying unfinished cards into tomorrow. */
+export async function reviewDay(done: string[], unfinished: Task[], streak: number): Promise<ReviewResult> {
+  const payload = unfinished.map((t) => ({ id: t.id, title: t.title, minutes: t.minutes }));
+  try {
+    const r = await call<{ recap: string; summary: string; proposals: Proposal[] }>({
+      action: 'review',
+      done,
+      unfinished: payload,
+      streak,
+    });
+    const ids = new Set(unfinished.map((t) => t.id));
+    const proposals = (r.proposals || []).filter(
+      (p) => ids.has(p.taskId) && ['morning', 'afternoon', 'evening'].includes(p.part),
+    );
+    if (r.recap) return { recap: r.recap, summary: r.summary || '', proposals, source: 'ai' };
+  } catch {
+    /* offline */
+  }
+  const plan = offlinePlan(unfinished);
+  const n = done.length;
+  const recap =
+    n === 0
+      ? 'A quiet day, and that is okay. Tomorrow is a fresh start.'
+      : n === 1
+        ? `You finished “${done[0]}”. One step forward counts.`
+        : `You finished ${n} cards today, including “${done[0]}”. Nice work.`;
+  return {
+    recap,
+    summary: unfinished.length ? 'Here is where I would carry your unfinished cards tomorrow.' : 'Nothing left over. Your rack is clear.',
+    proposals: plan.proposals,
+    source: 'offline',
+  };
+}
+
 export async function suggestTasks(context: string): Promise<SuggestResult> {
   try {
     const r = await call<{ tasks: SuggestResult['tasks'] }>({ action: 'suggest', context });

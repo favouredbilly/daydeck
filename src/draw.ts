@@ -23,6 +23,16 @@ export const C = {
   part: { morning: '#f59e0b', afternoon: '#3b82f6', evening: '#8b5cf6' } as Record<string, string>,
 };
 
+let textScale = 1;
+/** Accessibility: scale text drawn on cards and panels. */
+export function setTextScale(v: number) {
+  textScale = v;
+}
+/** Scale a font size by the current text scale. */
+export function ts(px: number) {
+  return Math.round(px * textScale);
+}
+
 const FONT = 'Inter, "Segoe UI", Roboto, system-ui, sans-serif';
 
 export function roundRect(g: CanvasRenderingContext2D, x: number, y: number, w: number, h: number, r: number) {
@@ -123,19 +133,19 @@ export function drawCard(
     g.restore();
   }
   g.fillStyle = C.ink;
-  g.font = `700 54px ${FONT}`;
+  g.font = `700 ${ts(54)}px ${FONT}`;
   g.textBaseline = 'middle';
   let lines = wrapText(g, title, w - 230, 1);
   if (g.measureText(title).width > w - 230) {
-    g.font = `700 44px ${FONT}`;
+    g.font = `700 ${ts(44)}px ${FONT}`;
     lines = wrapText(g, title, w - 230, 2);
   }
-  const lh = 50;
+  const lh = ts(50);
   const y0 = h / 2 - ((lines.length - 1) * lh) / 2;
   lines.forEach((l, i) => g.fillText(l, 44, y0 + i * lh));
   // minutes chip / AI badge
   const chip = opts.ghost ? '✦ AI' : `${minutes}m`;
-  g.font = `700 38px ${FONT}`;
+  g.font = `700 ${ts(38)}px ${FONT}`;
   const cw = g.measureText(chip).width + 36;
   roundRect(g, w - pad - 24 - cw, h / 2 - 28, cw, 56, 28);
   g.fillStyle = opts.ghost ? C.accent : '#f1eee7';
@@ -144,19 +154,22 @@ export function drawCard(
   g.fillText(chip, w - pad - 24 - cw + 18, h / 2 + 1);
 }
 
-export function drawButton(g: CanvasRenderingContext2D, w: number, h: number, label: string, style: 'primary' | 'secondary' | 'chip', hover = false) {
+export function drawButton(g: CanvasRenderingContext2D, w: number, h: number, label: string, style: 'primary' | 'secondary' | 'chip' | 'toggle-on', hover = false) {
   roundRect(g, 6, 6, w - 12, h - 12, (h - 12) / 2);
-  if (style === 'primary') g.fillStyle = hover ? '#4a3bc4' : C.accent;
+  if (style === 'primary' || style === 'toggle-on') g.fillStyle = hover ? '#4a3bc4' : C.accent;
   else if (style === 'chip') g.fillStyle = hover ? '#dcd6ff' : C.accentSoft;
   else g.fillStyle = hover ? '#e9e6f0' : '#f4f2f8';
   g.fill();
-  if (style !== 'primary') {
+  if (style !== 'primary' && style !== 'toggle-on') {
     g.lineWidth = 4;
     g.strokeStyle = style === 'chip' ? '#c9c1ff' : '#dad6e4';
     g.stroke();
   }
-  g.fillStyle = style === 'primary' ? '#fff' : C.ink;
+  g.fillStyle = style === 'primary' || style === 'toggle-on' ? '#fff' : C.ink;
   g.font = `700 ${Math.round(h * 0.36)}px ${FONT}`;
+  while (g.measureText(label).width > w - 40 && parseInt(g.font.split(' ')[1]) > 12) {
+    g.font = `700 ${parseInt(g.font.split(' ')[1]) - 2}px ${FONT}`;
+  }
   g.textAlign = 'center';
   g.textBaseline = 'middle';
   g.fillText(label, w / 2, h / 2 + 2);
